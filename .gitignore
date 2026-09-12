@@ -1,0 +1,24 @@
+# Output directories
+eval_results/
+logs/
+experiments/
+pruned_models/
+
+# Jupyter Notebooks
+notebooks/
+.ipynb_checkpoints/
+
+# Python caching & environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# OS specific
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
