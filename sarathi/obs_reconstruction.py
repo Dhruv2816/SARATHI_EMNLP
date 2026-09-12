@@ -1,25 +1,19 @@
 """
-obs_reconstruction_GREEDY.py — OLD Iterative Greedy OBS Weight Reconstruction
-===========================================================================
-This is the ORIGINAL implementation using the iterative greedy column pruning
-loop (_iterative_greedy_update), as it existed before the Cholesky least-squares
-optimization.
-
-To revert to this approach:
-    cp guide/obs_reconstruction_GREEDY_BACKUP.py guide/obs_reconstruction.py
+obs_reconstruction.py — Greedy OBS Weight Reconstruction
+=========================================================
 """
 
 import logging
 import sys
 import time
-from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from .model_utils import get_all_layers, get_mlp_modules, get_intermediate_size, set_intermediate_size, slice_mlp_layer
+from .model_utils import get_all_layers, get_intermediate_size, set_intermediate_size
+from .slice import slice_mlp_layer
 
 def _get_ffn_weights(model_name: str, layer):
     mn = model_name.lower()
@@ -33,15 +27,9 @@ def _get_ffn_weights(model_name: str, layer):
     else:
         raise ValueError(f"Architecture not supported by OBS: {model_name}")
 
-
 def _has_gated_ffn(model_name: str) -> bool:
     mn = model_name.lower()
     return any(k in mn for k in ("llama", "mistral"))
-
-
-# ---------------------------------------------------------------------------
-# OLD Iterative Greedy Refinement (ORIGINAL — replaced by Cholesky solver)
-# ---------------------------------------------------------------------------
 
 def _iterative_greedy_update(
     X: torch.Tensor,
@@ -49,19 +37,7 @@ def _iterative_greedy_update(
     K: int,
     damping: float = 1e-6,
     device: str = "cuda",
-    forced_keep_indices: Optional[torch.Tensor] = None,
 ) -> tuple:
-    """
-    Implements Local Greedy Refinement (Iterative OBS).
-    Starts with full dense weights W, computes exact inverse Hessian H^{-1},
-    and iteratively prunes columns of W that result in the smallest reconstruction error.
-    Returns:
-        W_pruned: Dense weight matrix with pruned columns set to 0.
-        keep_indices: 1D tensor of indices that were kept.
-
-    WARNING: This is extremely slow for large FFN dimensions (e.g. OPT-13B d_ffn=20480).
-    It will hang/deadlock due to CPU-GPU sync bottleneck in the greedy loop.
-    """
     d_in = X.shape[1]
     d_out = Y.shape[1]
 
@@ -89,38 +65,25 @@ def _iterative_greedy_update(
     alive_mask = torch.ones(d_in, dtype=torch.bool, device=device)
     num_to_prune = d_in - K
 
-    if forced_keep_indices is not None:
-        keep_mask = torch.zeros(d_in, dtype=torch.bool, device=device)
-        keep_mask[forced_keep_indices] = True
-        prune_order = (~keep_mask).nonzero(as_tuple=True)[0]
-    else:
-        # === Pre-rank pruning order ONCE (1 sync) instead of argmin per step ===
-        diag_H_init = H_inv.diagonal().clone()
-        W_norms_init = (W ** 2).sum(dim=0)
-        E_init = W_norms_init / diag_H_init.clamp(min=1e-8)
-        E_init[~alive_mask] = float('inf')
-        prune_order = torch.argsort(E_init)[:num_to_prune]  # ONE sync total
+    for step in range(num_to_prune):
+        diag_H = H_inv.diagonal()
+        W_norms = (W ** 2).sum(dim=0)
+        E = W_norms / diag_H
+        E[~alive_mask] = float('inf')
 
-    for idx, k in enumerate(prune_order):
-        k_int = k.item()
-        if not alive_mask[k_int]:
-            continue
-        alive_mask[k_int] = False
+        k = torch.argmin(E)
+        alive_mask[k] = False
 
-        h_k = H_inv[:, k_int].clone()
-        h_kk = h_k[k_int].clone()
-        w_k = W[:, k_int].clone()
+        h_k = H_inv[:, k].clone()
+        h_kk = h_k[k].clone()
+        w_k = W[:, k].clone()
 
         W.addr_(w_k, h_k, alpha=-1.0 / h_kk)
         H_inv.addr_(h_k, h_k, alpha=-1.0 / h_kk)
 
-        W[:, k_int] = 0.0
-        H_inv[:, k_int] = 0.0
-        H_inv[k_int, :] = 0.0
-        
-        # Prevent CUDA launch queue deadlock
-        if idx % 50 == 0:
-            torch.cuda.synchronize(device)
+        W[:, k] = 0.0
+        H_inv[:, k] = 0.0
+        H_inv[k, :] = 0.0
 
     keep_indices = alive_mask.nonzero(as_tuple=True)[0]
     return W.to(dtype=Y.dtype), keep_indices
@@ -198,13 +161,13 @@ def obs_reconstruct(
                     mask = torch.full((seq_len, seq_len), float("-inf"), device=layer_device, dtype=h_batch.dtype)
                     mask = torch.triu(mask, diagonal=1)
                     causal_mask = mask.view(1, 1, seq_len, seq_len).expand(bsz, -1, -1, -1)
-                    if layer.do_layer_norm_before:
+                    if getattr(layer, "do_layer_norm_before", True):
                         normed_h = layer.self_attn_layer_norm(h_batch)
                     else:
                         normed_h = h_batch
                     attn_out = layer.self_attn(normed_h, attention_mask=causal_mask)[0]
                     post_attn = h_batch + attn_out
-                    if not layer.do_layer_norm_before:
+                    if not getattr(layer, "do_layer_norm_before", True):
                         post_attn = layer.self_attn_layer_norm(post_attn)
                 else:
                     normed = layer.input_layernorm(h_batch)
@@ -218,17 +181,7 @@ def obs_reconstruct(
 
         if per_layer_keep_indices is not None:
             K = len(per_layer_keep_indices[layer_idx])
-            if gated:
-                # Gated FFN (LLaMA/Mistral): NMF/Wanda probe is accurate enough
-                # to directly force which neurons to keep (fully decoupled as per paper §2.2).
-                forced_indices = per_layer_keep_indices[layer_idx].to(layer_device)
-            else:
-                # Non-gated FFN (OPT/ReLU): NMF probe scores are near-uniform.
-                # Use probe only for the layer budget K; let greedy OBS dynamically
-                # select the best neurons via Hessian error minimisation (see paper §4).
-                forced_indices = None
         else:
-            forced_indices = None
             orig_size = get_intermediate_size(model_name, model)
             K = int(orig_size * (1.0 - compression_ratio))
 
@@ -240,7 +193,7 @@ def obs_reconstruct(
             _t_hessian_layer = time.time()
             for i in range(0, len(hiddens), batch_size):
                 x_b = post_attn_all[i : i + batch_size].to(layer_device)
-                if "opt" not in mn:
+                if getattr(layer, "do_layer_norm_before", True) and "opt" not in mn and hasattr(layer, "post_attention_layernorm"):
                     x_b = layer.post_attention_layernorm(x_b)
                 gate_out = nn.functional.silu(gate_proj(x_b))
                 up_out   = up_proj(x_b)
@@ -254,7 +207,7 @@ def obs_reconstruct(
 
             _t_hessian_total += time.time() - _t_hessian_layer
             _t_greedy_layer = time.time()
-            W_down_new, keep_indices = _iterative_greedy_update(X_ffn_flat, Y_down_flat, K, damping, str(layer_device), forced_keep_indices=forced_indices)
+            W_down_new, keep_indices = _iterative_greedy_update(X_ffn_flat, Y_down_flat, K, damping, str(layer_device))
             _t_greedy_total += time.time() - _t_greedy_layer
             keep_indices = keep_indices.cpu()
             down_proj.weight.data.copy_(W_down_new)
@@ -268,11 +221,8 @@ def obs_reconstruct(
             _t_hessian_layer = time.time()
             for i in range(0, len(hiddens), batch_size):
                 x_b = post_attn_all[i : i + batch_size].to(layer_device)
-                do_prenorm = getattr(layer, "do_layer_norm_before", True)
-                if do_prenorm:
-                    ln = getattr(layer, "final_layer_norm", None) or getattr(layer, "layer_norm", None)
-                    if ln is not None:
-                        x_b = ln(x_b)
+                if getattr(layer, "do_layer_norm_before", True):
+                    x_b = layer.final_layer_norm(x_b)
                 intermediate = nn.functional.relu(fc1(x_b))
                 out = nn.functional.linear(intermediate, fc2.weight)
                 fc2_out_list.append(out.detach().cpu())
@@ -283,20 +233,17 @@ def obs_reconstruct(
 
             _t_hessian_total += time.time() - _t_hessian_layer
             _t_greedy_layer = time.time()
-            W_fc2_new, keep_indices = _iterative_greedy_update(X_ffn_flat, Y_fc2_flat, K, damping, str(layer_device), forced_keep_indices=forced_indices)
+            W_fc2_new, keep_indices = _iterative_greedy_update(X_ffn_flat, Y_fc2_flat, K, damping, str(layer_device))
             _t_greedy_total += time.time() - _t_greedy_layer
             keep_indices = keep_indices.cpu()
             fc2.weight.data.copy_(W_fc2_new)
 
             if fc2.bias is not None:
                 _t_bias_layer = time.time()
-                # Y_fc2_flat is weight-only (no bias). Compute means consistently
-                # without adding fc2.bias to both sides (they cancel and cause dim errors
-                # after slicing changes fc2 output size).
-                old_mean = Y_fc2_flat.to(layer_device).mean(dim=0)
+                old_mean = Y_fc2_flat.to(layer_device).mean(dim=0) + fc2.bias.data
                 X_sliced = X_ffn_flat[:, keep_indices].to(layer_device)
                 W_sliced = W_fc2_new[:, keep_indices]
-                new_mean = (X_sliced @ W_sliced.t()).mean(dim=0)
+                new_mean = (X_sliced @ W_sliced.t()).mean(dim=0) + fc2.bias.data
                 shift = old_mean - new_mean
                 _t_bias_total += time.time() - _t_bias_layer
 
