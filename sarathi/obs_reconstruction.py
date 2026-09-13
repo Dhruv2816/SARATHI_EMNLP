@@ -89,6 +89,39 @@ def _iterative_greedy_update(
     return W.to(dtype=Y.dtype), keep_indices
 
 
+def _least_squares_update(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    W_shape: tuple,
+    damping: float = 1e-6,
+    device: str = "cuda",
+) -> torch.Tensor:
+    d_in = X.shape[1]
+    d_out = Y.shape[1]
+    H = torch.zeros((d_in, d_in), device=device, dtype=torch.float32)
+    XtY = torch.zeros((d_in, d_out), device=device, dtype=torch.float32)
+
+    chunk_size = 16384
+    for i in range(0, X.shape[0], chunk_size):
+        X_chunk = X[i:i+chunk_size].to(device=device, dtype=torch.float32)
+        Y_chunk = Y[i:i+chunk_size].to(device=device, dtype=torch.float32)
+        H += X_chunk.t() @ X_chunk
+        XtY += X_chunk.t() @ Y_chunk
+
+    damp_val = damping * torch.diag(H).mean().clamp(min=1e-8)
+    H.diagonal().add_(damp_val)
+
+    try:
+        L = torch.linalg.cholesky(H)
+        W_new_T = torch.cholesky_solve(XtY, L)
+    except torch.linalg.LinAlgError:
+        logging.warning("Cholesky failed — falling back to torch.linalg.lstsq")
+        W_new_T = torch.linalg.lstsq(H, XtY).solution
+
+    W_new = W_new_T.t()
+    return W_new.to(dtype=torch.float16).reshape(W_shape)
+
+
 @torch.no_grad()
 def obs_reconstruct(
     model,
@@ -180,38 +213,51 @@ def obs_reconstruct(
         post_attn_all = torch.cat(post_attn_list, dim=0)
 
         if per_layer_keep_indices is not None:
-            K = len(per_layer_keep_indices[layer_idx])
+            keep_indices = per_layer_keep_indices[layer_idx].to(layer_device)
         else:
             orig_size = get_intermediate_size(model_name, model)
             K = int(orig_size * (1.0 - compression_ratio))
+            lns = layer_scores[layer_idx]
+            top_k = torch.topk(lns.scores, K, largest=True)
+            keep_indices, _ = torch.sort(top_k.indices)
 
         gate_proj, up_proj, down_proj = _get_ffn_weights(model_name, layer)
 
         if gated:
             down_out_list = []
-            X_ffn_list = []
-            _t_hessian_layer = time.time()
             for i in range(0, len(hiddens), batch_size):
                 x_b = post_attn_all[i : i + batch_size].to(layer_device)
-                if getattr(layer, "do_layer_norm_before", True) and "opt" not in mn and hasattr(layer, "post_attention_layernorm"):
+                if "opt" not in mn and hasattr(layer, "post_attention_layernorm") and getattr(layer, "do_layer_norm_before", True):
                     x_b = layer.post_attention_layernorm(x_b)
                 gate_out = nn.functional.silu(gate_proj(x_b))
                 up_out   = up_proj(x_b)
                 intermediate = gate_out * up_out
                 out = down_proj(intermediate)
                 down_out_list.append(out.detach().cpu())
-                X_ffn_list.append(intermediate.detach().cpu())
 
             Y_down_flat = torch.cat(down_out_list, dim=0).reshape(-1, down_proj.out_features)
+
+            slice_mlp_layer(model_name, layer, keep_indices)
+            gate_proj, up_proj, down_proj = _get_ffn_weights(model_name, layer)
+
+            X_ffn_list = []
+            _t_hessian_layer = time.time()
+            for i in range(0, len(hiddens), batch_size):
+                x_b = post_attn_all[i : i + batch_size].to(layer_device)
+                if "opt" not in mn and hasattr(layer, "post_attention_layernorm") and getattr(layer, "do_layer_norm_before", True):
+                    x_b = layer.post_attention_layernorm(x_b)
+                gate_out = nn.functional.silu(gate_proj(x_b))
+                up_out   = up_proj(x_b)
+                intermediate = gate_out * up_out
+                X_ffn_list.append(intermediate.detach().cpu())
+
             X_ffn_flat = torch.cat(X_ffn_list, dim=0).reshape(-1, gate_proj.out_features)
 
             _t_hessian_total += time.time() - _t_hessian_layer
             _t_greedy_layer = time.time()
-            W_down_new, keep_indices = _iterative_greedy_update(X_ffn_flat, Y_down_flat, K, damping, str(layer_device))
+            W_down_new = _least_squares_update(X_ffn_flat, Y_down_flat, down_proj.weight.shape, damping, str(layer_device))
             _t_greedy_total += time.time() - _t_greedy_layer
-            keep_indices = keep_indices.cpu()
             down_proj.weight.data.copy_(W_down_new)
-            slice_mlp_layer(model_name, layer, keep_indices)
 
         else:
             fc1, _, fc2 = gate_proj, up_proj, down_proj
