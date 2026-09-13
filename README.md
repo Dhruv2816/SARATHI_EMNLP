@@ -230,10 +230,10 @@ For gated architectures (LLaMA, Mistral), gate and up projections are coupled pe
 
 SARATHI-E9FD includes a critical fix for **LLaMA-3-8B compatibility**: the OBS calibration forward pass uses `inspect.signature` to detect whether the attention layer expects `position_embeddings` (new rotary embedding API in LLaMA-3) and passes it correctly. The original SARATHI guide code hard-codes `attention_mask=None, position_ids=position_ids` which silently breaks on LLaMA-3.
 
-### Architecture-Specific Neuron Selection (See Paper §4)
-To maximize performance and align with the theoretical behavior described in the paper, the codebase automatically adapts its neuron selection strategy based on the model architecture during Phase 4:
-- **Gated FFN (LLaMA, Mistral):** The NMF/Wanda probe directly selects the neurons to keep. The OBS step operates as a fully decoupled fixed-constraint optimization (as described in **Section 2.2**).
-- **Non-Gated FFN (OPT):** As analysed in **Section 4**, probe scores for ReLU architectures are near-uniform. For these models, the probe is used to adaptively allocate the layer-wise budget (Adaptive Slicing), while the Greedy OBS loop dynamically selects the optimal neurons via Hessian error minimization to ensure stability.
+### Decoupled Budget Allocation and Greedy Reconstruction (See Paper §4)
+To maximize performance, ensure numerical stability, and prevent model collapse (especially for ReLU architectures), Phase 4 operates uniformly across all architectures:
+- **Adaptive Budget Allocation:** The NMF/Wanda probe acts in a data-free manner to compute the mathematically optimal number of neurons to retain ($K$) per layer (Adaptive Slicing).
+- **Iterative Greedy Selection:** Within this NMF-allocated budget $K$, the Iterative Greedy OBS loop dynamically selects the most salient neurons via local Hessian error minimization. This unified approach prevents the pathological collapse observed in standard pruning methods while maintaining the $\mathcal{O}(d^2)$ local memory constraint.
 
 ### OPT Calibration Dataset
 OPT models **must** use the C4 calibration dataset to avoid distribution shift:
