@@ -19,8 +19,10 @@ Dense LLM
     |-- Phase 3: STRUCTURED SLICE
     |       Keep Top-K neurons per layer -> permanently reduced intermediate_size
     |
-    +-- Phase 4: ADAPTIVE OBS RECONSTRUCTION  (optional, O(d^2) per layer)
-            Cholesky least-squares solve per layer
+    +-- Phase 4: ADAPTIVE OBS RECONSTRUCTION  (O(d^2) per layer)
+            Iterative Greedy OBS Weight Reconstruction
+            - Gated FFN (LLaMA/Mistral): Strict Decoupling (forced indices)
+            - Non-gated FFN (OPT): Adaptive Budget + Greedy Selection
             + Bias Shift Compensation (post-LayerNorm correction)
 ```
 
@@ -160,7 +162,7 @@ sarathi_submission/
 | `--nmf-iters` | `100` | NMF multiplicative update iterations |
 | `--n-calib` | `128` | Calibration samples (Variants B, C; OBS) |
 | `--obs-reconstruct` | `False` | Enable Adaptive OBS Weight Reconstruction |
-| `--obs-damping` | `1e-6` | Tikhonov regularisation for Cholesky solve (paper §3.1 uses `0.01`) |
+| `--obs-damping` | `1e-6` | Tikhonov regularisation for Iterative OBS solve (paper §3.1 uses `0.01`) |
 | `--adaptive` | `False` | Adaptive slicing (Global MAD threshold, variable K/layer) |
 | `--multi-gpu` | `False` | Multi-GPU loading for 13B+ models |
 | `--seed` | `42` | Random seed |
@@ -176,34 +178,6 @@ sarathi_submission/
 
 ---
 
-## Main Results
-
-### WikiText-2 Perplexity (lower is better)
-| Method | LLaMA-3-8B (25%) | Mistral-7B (25%) | OPT-2.7B (40%) | OPT-6.7B (40%) |
-|:---|:---:|:---:|:---:|:---:|
-| Dense | 6.14 | 5.25 | 12.47 | 10.86 |
-| SliceGPT | 8.92 | 7.41 | 28.73 | OOM |
-| SoBP | 8.11 | 6.89 | 22.34 | OOM |
-| Dynamic Slicing | 8.44 | 7.12 | 25.61 | OOM |
-| **SARATHI (ours)** | **7.53** | **6.31** | **18.98** | **16.42** |
-
-*OPT-6.7B at 40% sparsity: SARATHI is the only method that completes without OOM. All baselines crash due to coupled O(Ld^2) Hessian caching.*
-
-### Zero-Shot Accuracy (5-task average, higher is better)
-| Method | LLaMA-3-8B (25%) | Mistral-7B (25%) |
-|:---|:---:|:---:|
-| Dense | 72.8 | 71.3 |
-| SliceGPT | 62.1 | 60.4 |
-| SoBP | 64.7 | 62.9 |
-| **SARATHI (ours)** | **67.4** | **65.8** |
-| **SARATHI-Wanda (ours)** | **68.9** | **67.1** |
-
-### Ablation: Bias Shift Compensation (OPT-2.7B, 40% sparsity)
-| Configuration | WikiText-2 PPL |
-|:---|:---:|
-| SARATHI without Bias Shift Compensation | 2,082.4 |
-| **SARATHI with Bias Shift Compensation** | **18.98** |
-
 ### Reproducibility
 All experiments use:
 - `--seed 42`
@@ -211,24 +185,6 @@ All experiments use:
 - `--calib-seq-len 2048`
 - `--nmf-rank 7`, `--nmf-iters 100`
 - `--probe-sigma 0.10`
-
-### SwiGLU Neuron Score Coupling (Variant E / NMF)
-
-For gated architectures (LLaMA, Mistral), gate and up projections are coupled per neuron:
-
-| Coupling | Formula | Notes |
-|:---|:---|:---|
-| **Additive ★ current** | `(η_gate + η_up + η_down) / 3` | Used in all published SARATHI results. Empirically better. |
-| Multiplicative | `(η_gate × η_up × η_down)^(1/3)` | Stricter — requires ALL three projections to score high. Tested but produced worse PPL. |
-
-**Current code:** `sarathi/score.py` line ~335 uses **Additive** — this is the correct setting that matches the published results.
-
-> [!NOTE]  
-> We tested both settings empirically. Additive coupling consistently produced lower PPL and better zero-shot accuracy on Mistral-7B and LLaMA-3-8B. Multiplicative is mathematically stricter but was not used in the published paper results.
-
-### Key Implementation Fix vs. Baseline (obs_reconstruction.py)
-
-SARATHI-E9FD includes a critical fix for **LLaMA-3-8B compatibility**: the OBS calibration forward pass uses `inspect.signature` to detect whether the attention layer expects `position_embeddings` (new rotary embedding API in LLaMA-3) and passes it correctly. The original SARATHI guide code hard-codes `attention_mask=None, position_ids=position_ids` which silently breaks on LLaMA-3.
 
 ### Architecture-Specific Neuron Selection (See Paper §4)
 To maximize performance and align with the theoretical behavior described in the paper, the codebase automatically adapts its neuron selection strategy based on the model architecture during Phase 4:
